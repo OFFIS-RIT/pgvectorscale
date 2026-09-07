@@ -1,5 +1,10 @@
 # Concurrent DiskANN Writes
 
+Fork test release: `0.9.1-1`, based on upstream `0.9.1` at commit `9d9851c`.
+The `-1` suffix identifies this fork; Cargo treats it as a SemVer prerelease.
+For an existing installation, explicitly run
+`ALTER EXTENSION vectorscale UPDATE TO '0.9.1-1'` after the deployment steps below.
+
 DiskANN insertions no longer take a per-index transaction-level advisory lock.
 Graph search and distance calculations can run concurrently across PostgreSQL
 backends. This does not eliminate contention on hot graph nodes, physical pages,
