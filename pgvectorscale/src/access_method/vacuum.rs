@@ -12,7 +12,7 @@ use crate::{
         sbq::storage::SbqSpeedupStorage,
     },
     util::{
-        page::WritablePage,
+        page::{ReadablePage, WritablePage},
         ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber},
         ItemPointer,
     },
@@ -85,11 +85,14 @@ fn bulk_delete_for_storage<S: Storage, N: NodeVacuum>(
     callback_state: *mut ::std::os::raw::c_void,
 ) {
     for block_number in 0..nblocks {
-        let page = unsafe { WritablePage::cleanup(index, block_number) };
-        if page.get_type() != S::page_type() {
-            continue;
+        {
+            let page = unsafe { ReadablePage::read(index, block_number) };
+            // New and non-node pages do not need a cleanup lock.
+            // Release this pin before cleanup, then validate the current page there.
+            if page.is_new() || page.get_type() != S::page_type() {
+                continue;
+            }
         }
-        let mut modified = false;
 
         #[cfg(feature = "pg18")]
         unsafe {
@@ -99,6 +102,12 @@ fn bulk_delete_for_storage<S: Storage, N: NodeVacuum>(
         unsafe {
             pg_sys::vacuum_delay_point()
         };
+
+        let page = unsafe { WritablePage::cleanup(index, block_number) };
+        if page.get_type() != S::page_type() {
+            continue;
+        }
+        let mut modified = false;
 
         let max_offset = unsafe { PageGetMaxOffsetNumber(*page) };
         for offset_number in FirstOffsetNumber..(max_offset + 1) as _ {
@@ -160,6 +169,84 @@ pub extern "C-unwind" fn amvacuumcleanup(
 #[pgrx::pg_schema]
 pub mod tests {
     use pgrx::*;
+
+    #[pg_test]
+    fn vacuum_after_abandoned_new_page() {
+        use super::{ambulkdelete, amvacuumcleanup, MetaPage};
+        use crate::util::page::{PageType, ReadablePage, WritablePage};
+
+        unsafe extern "C-unwind" fn keep_tuple(
+            _item: pg_sys::ItemPointer,
+            _state: *mut std::ffi::c_void,
+        ) -> bool {
+            false
+        }
+
+        for layout in ["plain", "memory_optimized"] {
+            Spi::run(&format!(
+                "CREATE TABLE abandoned_page_test (embedding vector(3));
+                 INSERT INTO abandoned_page_test VALUES ('[1,2,3]'), ('[4,5,6]');
+                 CREATE INDEX abandoned_page_idx ON abandoned_page_test
+                 USING diskann (embedding) WITH (storage_layout = {layout});"
+            ))
+            .unwrap();
+            let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'abandoned_page_idx'::regclass::oid")
+                .unwrap()
+                .unwrap();
+            unsafe {
+                let index = PgRelation::from_pg_owned(pg_sys::RelationIdGetRelation(oid));
+                let metadata = MetaPage::fetch(&index);
+                let mut suffix = WritablePage::new(&index, PageType::Meta);
+                suffix.add_item(&[1, 2, 3]);
+                let suffix_block = suffix.get_block_number();
+                suffix.commit();
+                let abandoned = WritablePage::new(&index, PageType::Meta);
+                let zero_block = abandoned.get_block_number();
+                assert_eq!(zero_block, suffix_block + 1);
+                drop(abandoned);
+                assert!(ReadablePage::read(&index, zero_block).is_new());
+                assert_eq!(MetaPage::fetch(&index), metadata);
+
+                Spi::run("INSERT INTO abandoned_page_test VALUES ('[7,8,9]')").unwrap();
+                let metadata = MetaPage::fetch(&index);
+
+                // VACUUM cannot run through SPI inside pg_test's transaction.
+                // Exercise its real index callbacks, including metadata-based dispatch.
+                let mut info = pg_sys::IndexVacuumInfo {
+                    index: index.as_ptr(),
+                    ..Default::default()
+                };
+                let stats = ambulkdelete(
+                    &mut info,
+                    std::ptr::null_mut(),
+                    Some(keep_tuple),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!((*stats).num_index_tuples, 3.0);
+                assert_eq!((*stats).tuples_removed, 0.0);
+                let stats = amvacuumcleanup(&mut info, stats);
+                assert_eq!(
+                    (*stats).num_pages,
+                    pg_sys::RelationGetNumberOfBlocksInFork(
+                        index.as_ptr(),
+                        pg_sys::ForkNumber::MAIN_FORKNUM,
+                    )
+                );
+                assert!(ReadablePage::read(&index, zero_block).is_new());
+                assert_eq!(MetaPage::fetch(&index), metadata);
+            }
+            Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+            assert_eq!(
+                Spi::get_one::<i64>(
+                    "SELECT count(*) FROM (SELECT embedding FROM abandoned_page_test
+                     ORDER BY embedding <=> '[1,2,3]'::vector LIMIT 10) nearest"
+                )
+                .unwrap(),
+                Some(3)
+            );
+            Spi::run("DROP TABLE abandoned_page_test").unwrap();
+        }
+    }
 
     #[cfg(test)]
     static VAC_PLAIN_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> =

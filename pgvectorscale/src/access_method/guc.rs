@@ -6,8 +6,17 @@ pub static TSV_PARALLEL_FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new
 pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
+pub static TSV_LOG_INSERT_STATS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub fn init() {
+    GucRegistry::define_bool_guc(
+        c"diskann.log_insert_stats",
+        c"Log per-vector insertion timings and operation counts",
+        c"Diagnostic only: logging affects performance. No vector or label values are logged.",
+        &TSV_LOG_INSERT_STATS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
     GucRegistry::define_int_guc(
         unsafe { std::ffi::CStr::from_ptr("diskann.query_search_list_size".as_pg_cstr()) },
         unsafe {

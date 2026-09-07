@@ -13,8 +13,8 @@ use crate::{
         node::{ReadableNode, WriteableNode},
         pg_vector::PgVector,
         stats::{
-            GreedySearchStats, PruneNeighborStats, StatsDistanceComparison, StatsHeapNodeRead,
-            StatsNodeModify, StatsNodeRead, StatsNodeWrite,
+            GreedySearchStats, StatsDistanceComparison, StatsHeapNodeRead, StatsNodeModify,
+            StatsNodeRead, StatsNodeWrite,
         },
         storage::{ArchivedData, NodeDistanceMeasure, Storage},
         storage_common::get_index_vector_attribute,
@@ -88,20 +88,9 @@ pub struct PlainStorageLsnPrivateData {
 }
 
 impl PlainStorageLsnPrivateData {
-    pub fn new(
-        index_pointer_to_node: IndexPointer,
-        node: &ArchivedPlainNode,
-        gns: &mut GraphNeighborStore,
-        storage: &PlainStorage,
-        stats: &mut PruneNeighborStats,
-    ) -> Self {
+    pub fn new(node: &ArchivedPlainNode) -> Self {
         let heap_pointer = node.heap_item_pointer.deserialize_item_pointer();
-        let neighbors = match gns {
-            GraphNeighborStore::Disk => node.get_index_pointer_to_neighbors(),
-            GraphNeighborStore::Builder(b) => {
-                b.get_neighbors(index_pointer_to_node, storage, stats)
-            }
-        };
+        let neighbors = node.get_index_pointer_to_neighbors();
         Self {
             heap_pointer,
             neighbors,
@@ -138,20 +127,6 @@ impl Storage for PlainStorage<'_> {
         let node = PlainNode::new_for_full_vector(full_vector.to_vec(), heap_pointer, meta_page);
         let index_pointer: IndexPointer = node.write(tape, stats);
         index_pointer
-    }
-
-    fn finalize_node_at_end_of_build<S: StatsNodeRead + StatsNodeModify>(
-        &mut self,
-        index_pointer: IndexPointer,
-        neighbors: &[NeighborWithDistance],
-        stats: &mut S,
-    ) {
-        let mut node = unsafe { PlainNode::modify(self.index, index_pointer, stats) };
-        let mut archived = node.get_archived_node();
-        archived
-            .as_mut()
-            .set_neighbors(neighbors, self.num_neighbors);
-        node.commit();
     }
 
     unsafe fn get_node_distance_measure<'b, S: StatsNodeRead + StatsNodeWrite>(
@@ -205,7 +180,7 @@ impl Storage for PlainStorage<'_> {
         stats: &mut S,
     ) -> Vec<NeighborWithDistance> {
         let rn = unsafe { PlainNode::read(self.index, neighbors_of, stats) };
-        // Copy neighbors before giving ownership of `rn`` to the distance state
+        // Capture adjacency before the distance state copies the vector and releases rn.
         let neighbors: Vec<_> = rn.get_archived_node().iter_neighbors().collect();
         let dist_state = unsafe { IndexFullDistanceMeasure::with_readable_node(self, rn) };
         neighbors
@@ -243,10 +218,17 @@ impl Storage for PlainStorage<'_> {
             ),
         };
 
+        let mut private_data = PlainStorageLsnPrivateData::new(node);
+        drop(rn);
+        // A cache miss may evict and write a node on the page we just read.
+        if let GraphNeighborStore::Builder(b) = gns {
+            private_data.neighbors = b.get_neighbors(index_pointer, self, &mut lsr.prune_stats);
+        }
+
         Some(ListSearchNeighbor::new(
             index_pointer,
             lsr.create_distance_with_tie_break(distance, index_pointer),
-            PlainStorageLsnPrivateData::new(index_pointer, node, gns, self, &mut lsr.prune_stats),
+            private_data,
             None,
         ))
     }
@@ -281,16 +263,16 @@ impl Storage for PlainStorage<'_> {
                     &mut lsr.stats,
                 ),
             };
+            let mut private_data = PlainStorageLsnPrivateData::new(node_neighbor);
+            drop(rn_neighbor);
+            if let GraphNeighborStore::Builder(b) = gns {
+                private_data.neighbors =
+                    b.get_neighbors(neighbor_index_pointer, self, &mut lsr.prune_stats);
+            }
             let lsn = ListSearchNeighbor::new(
                 neighbor_index_pointer,
                 lsr.create_distance_with_tie_break(distance, neighbor_index_pointer),
-                PlainStorageLsnPrivateData::new(
-                    neighbor_index_pointer,
-                    node_neighbor,
-                    gns,
-                    self,
-                    &mut lsr.prune_stats,
-                ),
+                private_data,
                 None,
             );
 
@@ -306,18 +288,31 @@ impl Storage for PlainStorage<'_> {
         lsn.get_private_data().heap_pointer
     }
 
-    fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
+    fn try_set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
         &self,
         index_pointer: IndexPointer,
+        expected: &[IndexPointer],
         neighbors: &[NeighborWithDistance],
         stats: &mut S,
-    ) {
+    ) -> bool {
+        assert!(neighbors.len() <= self.num_neighbors as usize);
         let mut node = unsafe { PlainNode::modify(self.index, index_pointer, stats) };
         let mut archived = node.get_archived_node();
+        if !archived.iter_neighbors().eq(expected.iter().copied()) {
+            return false;
+        }
+        if archived.iter_neighbors().eq(neighbors
+            .iter()
+            .map(NeighborWithDistance::get_index_pointer_to_neighbor))
+        {
+            stats.record_unchanged();
+            return true;
+        }
         archived
             .as_mut()
             .set_neighbors(neighbors, self.num_neighbors);
         node.commit();
+        true
     }
 
     fn get_distance_function(&self) -> DistanceFn {

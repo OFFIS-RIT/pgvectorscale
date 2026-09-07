@@ -32,7 +32,8 @@ impl<'a> Tape<'a> {
         let nblocks = RelationGetNumberOfBlocksInFork(index.as_ptr(), ForkNumber::MAIN_FORKNUM);
         let mut current_block = None;
         for block in (0..nblocks).rev() {
-            if ReadablePage::read(index, block).get_type() == page_type {
+            let page = ReadablePage::read(index, block);
+            if !page.is_new() && page.get_type() == page_type {
                 current_block = Some(block);
                 break;
             }
@@ -168,6 +169,57 @@ mod tests {
                     "Writing more than available forces a new page"
                 );
             }
+        }
+    }
+
+    #[pg_test]
+    fn tape_resume_after_abandoned_new_page() {
+        let index = make_test_relation();
+        unsafe {
+            let metadata = ReadablePage::read(&index, 0)
+                .get_item_unchecked(2)
+                .get_data_slice()
+                .to_vec();
+            let mut tape = Tape::new(&index, PageType::PqQuantizerVector);
+            let first = tape.write(&[1, 2, 3]);
+            tape.close();
+
+            // An unpublished suffix can have committed pages followed by a zero page.
+            let mut suffix = WritablePage::new(&index, PageType::Meta);
+            suffix.add_item(&[4, 5, 6]);
+            let suffix_block = suffix.get_block_number();
+            suffix.commit();
+            let abandoned = WritablePage::new(&index, PageType::Meta);
+            let zero_block = abandoned.get_block_number();
+            assert_eq!(zero_block, suffix_block + 1);
+            drop(abandoned);
+            assert!(ReadablePage::read(&index, zero_block).is_new());
+            assert_eq!(
+                ReadablePage::read(&index, 0)
+                    .get_item_unchecked(2)
+                    .get_data_slice(),
+                metadata
+            );
+
+            let mut tape = Tape::resume(&index, PageType::PqQuantizerVector);
+            let next = tape.write(&[7, 8, 9]);
+            assert_eq!(next.block_number, first.block_number);
+            assert_eq!(next.offset, first.offset + 1);
+            let data =
+                ReadablePage::read(&index, next.block_number).get_item_unchecked(next.offset);
+            assert_eq!(data.get_data_slice(), &[7, 8, 9]);
+            drop(data);
+
+            // With no matching initialized page, extend rather than reuse the zero page.
+            let mut tape = Tape::resume(&index, PageType::PqQuantizerDef);
+            assert!(tape.write(&[10]).block_number > zero_block);
+            assert!(ReadablePage::read(&index, zero_block).is_new());
+            assert_eq!(
+                ReadablePage::read(&index, 0)
+                    .get_item_unchecked(2)
+                    .get_data_slice(),
+                metadata
+            );
         }
     }
 }

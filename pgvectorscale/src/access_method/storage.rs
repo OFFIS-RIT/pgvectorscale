@@ -62,13 +62,6 @@ pub trait Storage {
         stats: &mut S,
     ) -> ItemPointer;
 
-    fn finalize_node_at_end_of_build<S: StatsNodeRead + StatsNodeModify>(
-        &mut self,
-        index_pointer: IndexPointer,
-        neighbors: &[NeighborWithDistance],
-        stats: &mut S,
-    );
-
     unsafe fn get_node_distance_measure<'a, S: StatsNodeRead + StatsNodeWrite + StatsNodeModify>(
         &'a self,
         index_pointer: IndexPointer,
@@ -115,6 +108,8 @@ pub trait Storage {
     where
         Self: Sized;
 
+    /// Return owned neighbors in the order of one locked adjacency snapshot.
+    /// All source read guards must be released before returning.
     fn get_neighbors_with_distances_from_disk<
         S: StatsNodeRead + StatsDistanceComparison + StatsNodeWrite + StatsNodeModify,
     >(
@@ -123,12 +118,17 @@ pub trait Storage {
         stats: &mut S,
     ) -> Vec<NeighborWithDistance>;
 
-    fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
+    /// Compare the ordered logical adjacency and replace it under one exclusive
+    /// page lock. A mismatch returns false without modifying the page. Neither
+    /// distance calculations nor reads of other nodes may run under this lock.
+    /// Callers must release all node read guards before calling this method.
+    fn try_set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
         &self,
         index_pointer: IndexPointer,
+        expected: &[IndexPointer],
         neighbors: &[NeighborWithDistance],
         stats: &mut S,
-    );
+    ) -> bool;
 
     fn get_distance_function(&self) -> DistanceFn;
 

@@ -154,19 +154,24 @@ pub unsafe fn pgstat_count_index_scan(index_relation: pg_sys::Relation, indexrel
     }
 }
 
-/// Acquire a PostgreSQL transaction-level advisory lock for the given relation to serialize index
-/// operations. The lock is managed by Postgres, so no RAII/Drop implementation is needed.
-#[allow(non_snake_case)]
-pub fn acquire_index_lock(index: &PgRelation) {
-    let oid = u32::from(index.oid());
+/// Serialize entrypoint read/merge/publication, not an insertion or transaction.
+/// PostgreSQL releases this heavyweight lock on error; normal exits release it here.
+pub struct MetaPageLock<'a>(&'a PgRelation);
 
-    unsafe {
-        // Use PostgreSQL's transaction-level advisory lock with relation OID as key
-        // This will block until the lock is acquired and automatically release on transaction end
-        pgrx::direct_function_call::<()>(
-            pgrx::pg_sys::pg_advisory_xact_lock_int8,
-            &[Some(pgrx::pg_sys::Datum::from(oid as i64))],
-        );
+impl<'a> MetaPageLock<'a> {
+    pub fn new(index: &'a PgRelation) -> Self {
+        unsafe { pg_sys::LockPage(index.as_ptr(), 0, pg_sys::ExclusiveLock as _) };
+        Self(index)
+    }
+}
+
+impl Drop for MetaPageLock<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if pg_sys::IsTransactionState() {
+                pg_sys::UnlockPage(self.0.as_ptr(), 0, pg_sys::ExclusiveLock as _);
+            }
+        }
     }
 }
 

@@ -10,6 +10,7 @@ pub trait StatsHeapNodeRead {
 
 pub trait StatsNodeModify {
     fn record_modify(&mut self);
+    fn record_unchanged(&mut self) {}
 }
 
 pub trait StatsNodeWrite {
@@ -28,6 +29,9 @@ pub trait StatsNodeVisit {
 
 #[derive(Debug, Default)]
 pub struct PruneNeighborStats {
+    pub adjacency_attempts: usize,
+    pub adjacency_retries: usize,
+    pub unchanged_writes: usize,
     pub calls: usize,
     pub distance_comparisons: usize,
     pub node_reads: usize,
@@ -56,6 +60,10 @@ impl StatsNodeRead for PruneNeighborStats {
 impl StatsNodeModify for PruneNeighborStats {
     fn record_modify(&mut self) {
         self.node_modify += 1;
+    }
+
+    fn record_unchanged(&mut self) {
+        self.unchanged_writes += 1;
     }
 }
 
@@ -188,6 +196,11 @@ impl StatsNodeWrite for QuantizerStats {
 
 #[derive(Debug, Default)]
 pub struct InsertStats {
+    pub total_us: u128,
+    pub metadata_us: u128,
+    pub storage_us: u128,
+    pub node_write_us: u128,
+    pub graph_us: u128,
     pub prune_neighbor_stats: PruneNeighborStats,
     pub greedy_search_stats: GreedySearchStats,
     pub quantizer_stats: QuantizerStats,
@@ -215,7 +228,58 @@ impl StatsNodeWrite for InsertStats {
 }
 
 impl InsertStats {
+    pub fn log(
+        &self,
+        index: pgrx::pg_sys::Oid,
+        cache: Option<(usize, usize, crate::util::lru::CacheStats)>,
+    ) {
+        use pgrx::pg_sys;
+        let message = std::ffi::CString::new(format!(
+            "diskann insert stats index={}: {:?}, cache_entries_capacity_stats={:?}",
+            index, self, cache
+        ))
+        .unwrap();
+        // pgrx 0.16 does not expose statement/context suppression on ErrorReport.
+        // Keep this LOG-only FFI sequence behind its error boundary, with all
+        // Rust-owned allocations outside the trivially-deallocated closure.
+        unsafe extern "C-unwind" {
+            fn errstart(level: std::ffi::c_int, domain: *const std::ffi::c_char) -> bool;
+            fn errhidestmt(hide: bool) -> std::ffi::c_int;
+            fn errhidecontext(hide: bool) -> std::ffi::c_int;
+            fn errmsg_internal(format: *const std::ffi::c_char, ...) -> std::ffi::c_int;
+            fn errfinish(
+                file: *const std::ffi::c_char,
+                line: std::ffi::c_int,
+                function: *const std::ffi::c_char,
+            );
+        }
+        let message_ptr = message.as_ptr();
+        unsafe {
+            pg_sys::ffi::pg_guard_ffi_boundary(|| {
+                if errstart(pg_sys::LOG as _, std::ptr::null()) {
+                    errhidestmt(true);
+                    errhidecontext(true);
+                    errmsg_internal(c"%s".as_ptr(), message_ptr);
+                    errfinish(
+                        c"vectorscale".as_ptr(),
+                        line!() as _,
+                        c"insert_stats".as_ptr(),
+                    );
+                }
+            });
+        }
+    }
+
     pub fn merge(&mut self, other: &InsertStats) {
+        self.total_us += other.total_us;
+        self.metadata_us += other.metadata_us;
+        self.storage_us += other.storage_us;
+        self.node_write_us += other.node_write_us;
+        self.graph_us += other.graph_us;
+        self.prune_neighbor_stats.adjacency_attempts +=
+            other.prune_neighbor_stats.adjacency_attempts;
+        self.prune_neighbor_stats.adjacency_retries += other.prune_neighbor_stats.adjacency_retries;
+        self.prune_neighbor_stats.unchanged_writes += other.prune_neighbor_stats.unchanged_writes;
         // Merge individual stats
         self.prune_neighbor_stats.calls += other.prune_neighbor_stats.calls;
         self.prune_neighbor_stats.distance_comparisons +=

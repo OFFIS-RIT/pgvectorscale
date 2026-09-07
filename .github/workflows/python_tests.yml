@@ -23,6 +23,9 @@ jobs:
             minor: 0
           - major: 18
             minor: 0
+          - major: 18
+            minor: 0
+            parallel: true
     env:
       PG_SRC_DIR: pgbuild
       PG_INSTALL_DIR: postgresql
@@ -80,7 +83,7 @@ jobs:
           # Reinitialize pgrx to ensure it uses the correct PostgreSQL version
           cargo pgrx init --pg${{ matrix.pg.major }}=$PG_CONFIG
           # Install with explicit version matching
-          cargo pgrx install --no-default-features --features pg${{ matrix.pg.major }}
+          cargo pgrx install --no-default-features --features pg${{ matrix.pg.major }}${{ matrix.pg.parallel && ',build_parallel' || '' }}
 
       - name: Install Python dependencies
         run: |
@@ -108,7 +111,12 @@ jobs:
 
       - name: Run Python tests
         env:
-          DATABASE_URL: postgresql+asyncpg://postgres@localhost:5432/test_db
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_NAME: test_db
+          VECTORSCALE_TEST_LOG_FILE: /tmp/postgres.log
+          VECTORSCALE_TEST_PARALLEL_BUILD: ${{ matrix.pg.parallel && '1' || '0' }}
         run: |
           export PATH=~/${{ env.PG_INSTALL_DIR }}/bin:$PATH
           pytest tests/ -v --tb=short
@@ -117,7 +125,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: python-test-results-pg${{ matrix.pg.major }}
+          name: python-test-results-pg${{ matrix.pg.major }}-parallel-${{ matrix.pg.parallel && 'on' || 'off' }}
           path: |
             pytest.log
             test-results.xml

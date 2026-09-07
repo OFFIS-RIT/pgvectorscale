@@ -217,35 +217,34 @@ impl<'a> Graph<'a> {
         additional_neighbors: Vec<NeighborWithDistance>,
         stats: &mut PruneNeighborStats,
     ) -> (bool, Vec<NeighborWithDistance>) {
-        let mut candidates = self
-            .neighbor_store
-            .get_neighbors_with_full_vector_distances(neighbors_of, storage, stats);
+        let GraphNeighborStore::Builder(builder) = &self.neighbor_store else {
+            return Self::merge_neighbors_on_disk(
+                storage,
+                neighbors_of,
+                labels,
+                &additional_neighbors,
+                self.meta_page.get_max_alpha(),
+                self.meta_page.get_num_neighbors() as usize,
+                neighbor_store::NeighborMergeMode::Disk,
+                stats,
+            );
+        };
+        let labels = labels
+            .cloned()
+            .or_else(|| storage.get_labels(neighbors_of, stats));
+        let mut candidates =
+            builder.get_neighbors_with_full_vector_distances(neighbors_of, storage, stats);
 
-        let mut hash: HashSet<ItemPointer> = candidates
-            .iter()
-            .map(|c| c.get_index_pointer_to_neighbor())
-            .collect();
-        for n in additional_neighbors {
-            if hash.insert(n.get_index_pointer_to_neighbor()) {
-                candidates.push(n);
-            }
-        }
-        //remove myself
-        if !hash.insert(neighbors_of) {
-            //prevent self-loops
-            let index = candidates
-                .iter()
-                .position(|x| x.get_index_pointer_to_neighbor() == neighbors_of)
-                .unwrap();
-            candidates.remove(index);
-        }
+        candidates.extend(additional_neighbors);
+        let mut seen = HashSet::from([neighbors_of]);
+        candidates.retain(|n| seen.insert(n.get_index_pointer_to_neighbor()));
 
         let (pruned, new_neighbors) =
             if candidates.len() > self.neighbor_store.max_neighbors(self.get_meta_page()) {
                 let new_list = Self::prune_neighbors(
                     self.meta_page.get_max_alpha(),
                     self.meta_page.get_num_neighbors() as _,
-                    labels,
+                    labels.as_ref(),
                     candidates,
                     storage,
                     stats,
@@ -255,14 +254,70 @@ impl<'a> Graph<'a> {
                 (false, candidates)
             };
 
-        self.neighbor_store.set_neighbors(
-            storage,
-            neighbors_of,
-            labels.cloned(),
-            new_neighbors.clone(),
-            stats,
-        );
+        builder.set_neighbors(neighbors_of, labels, new_neighbors.clone(), storage, stats);
         (pruned, new_neighbors)
+    }
+
+    /// Retry the entire merge/prune operation against a fresh disk snapshot.
+    /// Keep additions unchanged: a failed prune must not discard retry candidates.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn merge_neighbors_on_disk<S: Storage>(
+        storage: &S,
+        neighbors_of: IndexPointer,
+        labels: Option<&LabelSet>,
+        added_neighbors: &[NeighborWithDistance],
+        max_alpha: f64,
+        num_neighbors: usize,
+        mode: neighbor_store::NeighborMergeMode,
+        stats: &mut PruneNeighborStats,
+    ) -> (bool, Vec<NeighborWithDistance>) {
+        let labels = labels
+            .cloned()
+            .or_else(|| storage.get_labels(neighbors_of, stats));
+        loop {
+            pgrx::check_for_interrupts!();
+            let disk_neighbors =
+                storage.get_neighbors_with_distances_from_disk(neighbors_of, stats);
+            let expected: Vec<_> = disk_neighbors
+                .iter()
+                .map(NeighborWithDistance::get_index_pointer_to_neighbor)
+                .collect();
+
+            let (mut candidates, always_prune) = match mode {
+                neighbor_store::NeighborMergeMode::Disk => {
+                    let mut candidates = disk_neighbors;
+                    candidates.extend_from_slice(added_neighbors);
+                    (candidates, false)
+                }
+                neighbor_store::NeighborMergeMode::Builder { always_prune } => {
+                    let mut candidates = added_neighbors.to_vec();
+                    candidates.extend(disk_neighbors);
+                    (candidates, always_prune)
+                }
+            };
+            let mut seen = HashSet::from([neighbors_of]);
+            candidates.retain(|n| seen.insert(n.get_index_pointer_to_neighbor()));
+            let pruned = always_prune || candidates.len() > num_neighbors;
+            let neighbors = if pruned {
+                Self::prune_neighbors(
+                    max_alpha,
+                    num_neighbors,
+                    labels.as_ref(),
+                    candidates,
+                    storage,
+                    stats,
+                )
+            } else {
+                candidates
+            };
+
+            // Both the snapshot reader and pruning distance states are gone here.
+            stats.adjacency_attempts += 1;
+            if storage.try_set_neighbors_on_disk(neighbors_of, &expected, &neighbors, stats) {
+                return (pruned, neighbors);
+            }
+            stats.adjacency_retries += 1;
+        }
     }
 
     pub fn get_meta_page(&self) -> &MetaPage {
@@ -495,6 +550,18 @@ impl<'a> Graph<'a> {
         storage: &S,
         stats: &mut PruneNeighborStats,
     ) {
+        if self
+            .meta_page
+            .get_start_nodes()
+            .is_some_and(|nodes| nodes.contains_all(vec.labels()))
+        {
+            return;
+        }
+
+        // Entrypoints only grow. Recheck under an operation-scoped lock before
+        // publishing a new default or label root from a backend-local snapshot.
+        let _lock = crate::util::ports::MetaPageLock::new(index);
+        *self.meta_page = MetaPage::fetch(index);
         match self.meta_page.get_start_nodes() {
             Some(start_nodes) => {
                 if start_nodes.contains_all(vec.labels()) {
@@ -504,13 +571,10 @@ impl<'a> Graph<'a> {
             None => {
                 // TODO probably better set off of centroids
                 let start_nodes = StartNodes::new(index_pointer);
-                self.neighbor_store.set_neighbors(
+                self.neighbor_store.initialize_neighbors(
                     storage,
                     index_pointer,
                     vec.labels().cloned(),
-                    Vec::<NeighborWithDistance>::with_capacity(
-                        self.neighbor_store.max_neighbors(self.meta_page) as _,
-                    ),
                     stats,
                 );
 

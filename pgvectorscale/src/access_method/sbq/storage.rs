@@ -1,4 +1,4 @@
-use std::{cell::RefCell, iter::once, marker::PhantomData};
+use std::{cell::RefCell, marker::PhantomData};
 
 use pgrx::{pg_sys::AttrNumber, PgBox, PgRelation};
 
@@ -46,8 +46,10 @@ pub struct SbqSpeedupStorage<'a> {
 
 impl<'a> SbqSpeedupStorage<'a> {
     fn sbq_vec_len(meta_page: &MetaPage) -> usize {
-        meta_page.get_num_dimensions() as usize * meta_page.get_bq_num_bits_per_dimension() as usize
-            / 64
+        SbqQuantizer::quantized_size_internal(
+            meta_page.get_num_dimensions_to_index() as usize,
+            meta_page.get_bq_num_bits_per_dimension(),
+        )
     }
 
     pub unsafe fn new_for_build<S: StatsNodeRead>(
@@ -93,7 +95,7 @@ impl<'a> SbqSpeedupStorage<'a> {
             quantizer: Self::load_quantizer(index_relation, meta_page, stats),
             heap_rel,
             heap_attr: get_index_vector_attribute(index_relation),
-            qv_cache: Some(RefCell::new(QuantizedVectorCache::new(
+            qv_cache: Some(RefCell::new(QuantizedVectorCache::new_for_insert(
                 QUANTIZED_VECTOR_CACHE_SIZE,
                 Self::sbq_vec_len(meta_page),
                 meta_page.get_num_neighbors() as usize,
@@ -142,8 +144,10 @@ impl<'a> SbqSpeedupStorage<'a> {
                         &mut lsr.stats,
                     )
                 };
-                let node_visiting = rn_visiting.get_archived_node();
-                let neighbors = node_visiting.get_index_pointer_to_neighbors();
+                let neighbors = rn_visiting
+                    .get_archived_node()
+                    .get_index_pointer_to_neighbors();
+                drop(rn_visiting);
 
                 for &neighbor_index_pointer in neighbors.iter() {
                     if !lsr.prepare_insert(neighbor_index_pointer) {
@@ -177,6 +181,14 @@ impl<'a> SbqSpeedupStorage<'a> {
                         .as_ref()
                         .expect("sdm is Some")
                         .calculate_bq_distance(bq_vector, gns, &mut lsr.stats);
+
+                    // Reuse immutable payloads during backlink pruning. Search-only
+                    // storage has no cache; adjacency and heap TIDs are never cached here.
+                    if let Some(cache) = &self.qv_cache {
+                        cache
+                            .borrow_mut()
+                            .remember(neighbor_index_pointer, bq_vector.to_vec());
+                    }
 
                     let lsn = ListSearchNeighbor::new(
                         neighbor_index_pointer,
@@ -264,29 +276,10 @@ impl Storage for SbqSpeedupStorage<'_> {
         let node = SbqNode::with_meta(heap_pointer, meta_page, bq_vector.as_slice(), labels);
 
         let index_pointer: IndexPointer = node.write(tape, stats);
+        if let Some(cache) = &self.qv_cache {
+            cache.borrow_mut().remember(index_pointer, bq_vector);
+        }
         index_pointer
-    }
-
-    fn finalize_node_at_end_of_build<S: StatsNodeRead + StatsNodeModify>(
-        &mut self,
-        index_pointer: IndexPointer,
-        neighbors: &[NeighborWithDistance],
-        stats: &mut S,
-    ) {
-        let mut cache = self.qv_cache.as_ref().unwrap().borrow_mut();
-        /* It's important to preload cache with all the items since you can run into deadlocks
-        if you try to fetch a quantized vector while holding the SbqNode::modify lock */
-        let iter = neighbors
-            .iter()
-            .map(|n| n.get_index_pointer_to_neighbor())
-            .chain(once(index_pointer));
-        cache.preload(iter, self, stats);
-
-        let mut node =
-            unsafe { SbqNode::modify(self.index, index_pointer, self.has_labels, stats) };
-        let mut archived = node.get_archived_node();
-        archived.set_neighbors(neighbors, self.num_neighbors);
-        node.commit();
     }
 
     unsafe fn get_node_distance_measure<'b, S: StatsNodeRead + StatsNodeWrite + StatsNodeModify>(
@@ -332,18 +325,44 @@ impl Storage for SbqSpeedupStorage<'_> {
         neighbors_of: ItemPointer,
         stats: &mut S,
     ) -> Vec<NeighborWithDistance> {
-        let rn = unsafe { SbqNode::read(self.index, neighbors_of, self.has_labels, stats) };
-        let archived = rn.get_archived_node();
-        let q = archived.get_bq_vector();
+        let (neighbors, q) = {
+            let rn = unsafe { SbqNode::read(self.index, neighbors_of, self.has_labels, stats) };
+            let archived = rn.get_archived_node();
+            (
+                archived.get_index_pointer_to_neighbors(),
+                archived.get_bq_vector().to_vec(),
+            )
+        };
 
-        rn.get_archived_node()
-            .iter_neighbors()
+        // Classic nodes need no label reads. Reuse the per-insertion vector
+        // cache, but always obtain adjacency from the current locked page.
+        if !self.has_labels {
+            if let Some(cache) = &self.qv_cache {
+                let mut cache = cache.borrow_mut();
+                return neighbors
+                    .into_iter()
+                    .map(|n| {
+                        let vector = cache.get(n, self, stats);
+                        stats.record_quantized_distance_comparison();
+                        let dist = distance_xor_optimized(&q, vector);
+                        NeighborWithDistance::new(
+                            n,
+                            DistanceWithTieBreak::new(dist as f32, neighbors_of, n),
+                            None,
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        neighbors
+            .into_iter()
             .map(|n| {
                 //OPT: we can optimize this if num_dimensions_for_neighbors == num_dimensions_to_index
                 let rn1 = unsafe { SbqNode::read(self.index, n, self.has_labels, stats) };
                 let arch = rn1.get_archived_node();
                 stats.record_quantized_distance_comparison();
-                let dist = distance_xor_optimized(q, arch.get_bq_vector());
+                let dist = distance_xor_optimized(&q, arch.get_bq_vector());
                 NeighborWithDistance::new(
                     n,
                     DistanceWithTieBreak::new(dist as f32, neighbors_of, n),
@@ -413,27 +432,30 @@ impl Storage for SbqSpeedupStorage<'_> {
         node.get_heap_item_pointer()
     }
 
-    fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
+    fn try_set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(
         &self,
         index_pointer: IndexPointer,
+        expected: &[IndexPointer],
         neighbors: &[NeighborWithDistance],
         stats: &mut S,
-    ) {
-        let mut cache = self.cache().as_ref().unwrap().borrow_mut();
-
-        /* It's important to preload cache with all the items since you can run into deadlocks
-        if you try to fetch a quantized vector while holding the SbqNode::modify lock */
-        let iter = neighbors
-            .iter()
-            .map(|n| n.get_index_pointer_to_neighbor())
-            .chain(once(index_pointer));
-        cache.preload(iter, self, stats);
-
+    ) -> bool {
+        assert!(neighbors.len() <= self.num_neighbors as usize);
         let mut node =
             unsafe { SbqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
+        if !archived.iter_neighbors().eq(expected.iter().copied()) {
+            return false;
+        }
+        if archived.iter_neighbors().eq(neighbors
+            .iter()
+            .map(NeighborWithDistance::get_index_pointer_to_neighbor))
+        {
+            stats.record_unchanged();
+            return true;
+        }
         archived.set_neighbors(neighbors, self.num_neighbors);
         node.commit();
+        true
     }
 
     fn get_distance_function(&self) -> DistanceFn {

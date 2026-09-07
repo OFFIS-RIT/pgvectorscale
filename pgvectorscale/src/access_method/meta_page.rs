@@ -14,7 +14,7 @@ use super::storage_common::get_num_index_attributes;
 use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::options::TSVIndexOptions;
-use crate::access_method::stats::WriteStats;
+use crate::access_method::stats::{StatsNodeWrite, WriteStats};
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType};
 use crate::util::*;
@@ -73,7 +73,7 @@ impl From<&MetaPageV1> for MetaPage {
 
         MetaPage {
             magic_number: meta.magic_number,
-            version: meta.version,
+            version: TSV_VERSION,
             extension_version_when_built: "0.0.2".to_string(),
             distance_type: DistanceType::L2 as u16,
             num_dimensions: meta.num_dimensions,
@@ -144,7 +144,7 @@ impl From<MetaPageV2> for MetaPage {
 
         MetaPage {
             magic_number: meta.magic_number,
-            version: meta.version,
+            version: TSV_VERSION,
             extension_version_when_built: meta.extension_version_when_built,
             distance_type: meta.distance_type,
             num_dimensions: meta.num_dimensions,
@@ -371,22 +371,19 @@ impl MetaPage {
         assert!(header.magic_number == TSV_MAGIC_NUMBER);
         assert!(header.version == TSV_VERSION);
 
+        let header_bytes = header.serialize_to_vec();
+        let meta_bytes = self.serialize_to_vec();
         let mut stats = WriteStats::default();
-        let mut tape = if first_time {
-            ChainTapeWriter::new(index, PageType::Meta, &mut stats)
-        } else {
-            ChainTapeWriter::reinit(index, PageType::Meta, &mut stats, META_BLOCK_NUMBER)
-        };
-
-        // Serialize the header
-        let bytes = header.serialize_to_vec();
-        let off = tape.write(&bytes);
-        assert_eq!(off, ItemPointer::new(META_BLOCK_NUMBER, META_HEADER_OFFSET));
-
-        // Serialize the meta
-        let bytes = self.serialize_to_vec();
-        let off = tape.write(&bytes);
-        assert_eq!(off, ItemPointer::new(META_BLOCK_NUMBER, META_OFFSET));
+        let root = ChainTapeWriter::prepare_root(
+            index,
+            PageType::Meta,
+            &mut stats,
+            META_BLOCK_NUMBER,
+            first_time,
+            &[&header_bytes, &meta_bytes],
+        );
+        root.commit();
+        stats.record_write();
     }
 
     unsafe fn load(index: &PgRelation) -> MetaPage {
@@ -409,15 +406,10 @@ impl MetaPage {
             let meta = match page_type {
                 PageType::MetaV1 => {
                     let old_meta = MetaPageV1::page_get_meta(*page, *(*(page.get_buffer())));
-                    let new_meta: MetaPage = (&*old_meta).into();
-
-                    //release the page
-                    std::mem::drop(page);
-
-                    new_meta.store(index, false);
-                    new_meta
+                    (&*old_meta).into()
                 }
                 PageType::MetaV2 => MetaPageV2::from_page(page).into(),
+                // Keep the root share-locked throughout the chain read so publication waits.
                 PageType::Meta => Self::load(index),
                 _ => pgrx::error!("Meta page is not of type Meta"),
             };
@@ -439,5 +431,183 @@ impl MetaPage {
 
     pub fn set_quantizer_metadata_pointer(&mut self, quantizer_pointer: IndexPointer) {
         self.quantizer_metadata = quantizer_pointer;
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+
+    fn make_test_relation() -> PgRelation {
+        // An empty relation lets store(first_time = true) allocate block zero itself.
+        Spi::run("CREATE TABLE meta_test (value integer)").unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'meta_test'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        unsafe { PgRelation::from_pg_owned(pg_sys::RelationIdGetRelation(oid)) }
+    }
+
+    fn make_meta() -> MetaPage {
+        MetaPage {
+            magic_number: TSV_MAGIC_NUMBER,
+            version: TSV_VERSION,
+            extension_version_when_built: env!("CARGO_PKG_VERSION").to_string(),
+            distance_type: DistanceType::L2 as u16,
+            num_dimensions: 3,
+            num_dimensions_to_index: 3,
+            bq_num_bits_per_dimension: 1,
+            storage_type: StorageType::Plain as u8,
+            num_neighbors: 30,
+            search_list_size: 100,
+            max_alpha: 1.2,
+            start_nodes: Some(StartNodes::new(ItemPointer::new(7, 1))),
+            quantizer_metadata: ItemPointer::new_invalid(),
+            has_labels: false,
+        }
+    }
+
+    fn assert_current_root(index: &PgRelation, expected: &MetaPage) {
+        assert_eq!(&MetaPage::fetch(index), expected);
+        let root = unsafe { page::ReadablePage::read(index, META_BLOCK_NUMBER) };
+        assert_eq!(root.get_type(), PageType::Meta);
+        let mut stats = WriteStats::default();
+        let mut reader = ChainItemReader::new(index, PageType::Meta, &mut stats);
+        let mut header = reader.read(ItemPointer::new(META_BLOCK_NUMBER, META_HEADER_OFFSET));
+        let item = header.next().unwrap();
+        let header_value = rkyv::from_bytes::<MetaPageHeader>(item.get_data_slice()).unwrap();
+        assert_eq!(header_value.magic_number, TSV_MAGIC_NUMBER);
+        assert_eq!(header_value.version, TSV_VERSION);
+        assert!(header.next().is_none());
+        // fetch reads metadata from the unchanged fixed offset 2.
+        assert_eq!(META_HEADER_OFFSET, 1);
+        assert_eq!(META_OFFSET, 2);
+    }
+
+    #[pg_test]
+    fn test_meta_atomic_root_roundtrip() {
+        let index = make_test_relation();
+        let mut meta = make_meta();
+        meta.extension_version_when_built = "x".repeat(3 * pg_sys::BLCKSZ as usize);
+        unsafe { meta.store(&index, true) };
+        assert_current_root(&index, &meta);
+
+        // Exercise alignment and the root/suffix boundary, then replace a large value with small.
+        for size in (pg_sys::BLCKSZ as usize - 256..pg_sys::BLCKSZ as usize + 16)
+            .chain([4 * pg_sys::BLCKSZ as usize, 1])
+        {
+            meta.extension_version_when_built = "y".repeat(size);
+            unsafe { meta.store(&index, false) };
+            assert_current_root(&index, &meta);
+        }
+    }
+
+    #[pg_test]
+    fn test_meta_v3_forward_chain_then_replace() {
+        let index = make_test_relation();
+        let mut meta = make_meta();
+        meta.extension_version_when_built = "x".repeat(3 * pg_sys::BLCKSZ as usize);
+        let header = MetaPageHeader {
+            magic_number: TSV_MAGIC_NUMBER,
+            version: TSV_VERSION,
+        };
+        // Persist the version 3 layout using the writer used before atomic publication.
+        let mut stats = WriteStats::default();
+        let mut tape = ChainTapeWriter::new(&index, PageType::Meta, &mut stats);
+        assert_eq!(
+            tape.write(&header.serialize_to_vec()),
+            ItemPointer::new(0, 1)
+        );
+        assert_eq!(tape.write(&meta.serialize_to_vec()), ItemPointer::new(0, 2));
+        assert_current_root(&index, &meta);
+
+        for size in [4 * pg_sys::BLCKSZ as usize, 1] {
+            meta.extension_version_when_built = "y".repeat(size);
+            unsafe { meta.store(&index, false) };
+            assert_current_root(&index, &meta);
+        }
+    }
+
+    #[pg_test]
+    fn test_meta_v1_fetch_readonly_then_store() {
+        let index = make_test_relation();
+        let old = MetaPageV1 {
+            magic_number: TSV_MAGIC_NUMBER,
+            version: 1,
+            num_dimensions: 3,
+            num_neighbors: 30,
+            search_list_size: 100,
+            max_alpha: 1.2,
+            init_ids_block_number: 7,
+            init_ids_offset: 1,
+            use_pq: false,
+            _pq_vector_length: 0,
+            _pq_block_number: InvalidBlockNumber,
+            _pq_block_offset: InvalidOffsetNumber,
+        };
+        let root = page::WritablePage::new(&index, PageType::MetaV1);
+        unsafe {
+            let contents = ports::PageGetContents(*root);
+            std::ptr::write(contents.cast::<MetaPageV1>(), old);
+            // Generic WAL excludes the free-space hole; the legacy struct is page contents.
+            (*(*root).cast::<pg_sys::PageHeaderData>()).pd_lower =
+                (contents.offset_from(*root) as usize + std::mem::size_of::<MetaPageV1>()) as u16;
+        }
+        root.commit();
+
+        let meta = MetaPage::fetch(&index);
+        assert_eq!(meta.version, TSV_VERSION);
+        assert_eq!(meta.extension_version_when_built, "0.0.2");
+        assert_eq!(meta.start_nodes, make_meta().start_nodes);
+        {
+            let root = unsafe { page::ReadablePage::read(&index, META_BLOCK_NUMBER) };
+            assert_eq!(root.get_type(), PageType::MetaV1);
+            let persisted = unsafe { MetaPageV1::page_get_meta(*root, **root.get_buffer()) };
+            assert_eq!(unsafe { (*persisted).version }, 1);
+        }
+        assert_eq!(MetaPage::fetch(&index), meta);
+        unsafe { meta.store(&index, false) };
+        assert_current_root(&index, &meta);
+    }
+
+    #[pg_test]
+    fn test_meta_v2_fetch_readonly_then_store() {
+        let index = make_test_relation();
+        let expected = make_meta();
+        let old = MetaPageV2 {
+            magic_number: expected.magic_number,
+            version: 2,
+            extension_version_when_built: expected.extension_version_when_built.clone(),
+            distance_type: expected.distance_type,
+            num_dimensions: expected.num_dimensions,
+            num_dimensions_to_index: expected.num_dimensions_to_index,
+            bq_num_bits_per_dimension: expected.bq_num_bits_per_dimension,
+            storage_type: expected.storage_type,
+            num_neighbors: expected.num_neighbors,
+            search_list_size: expected.search_list_size,
+            max_alpha: expected.max_alpha,
+            init_ids: expected.start_nodes.as_ref().unwrap().default_node(),
+            quantizer_metadata: expected.quantizer_metadata,
+        };
+        let header = MetaPageHeader {
+            magic_number: TSV_MAGIC_NUMBER,
+            version: 2,
+        };
+        let mut root = page::WritablePage::new(&index, PageType::MetaV2);
+        assert_eq!(
+            root.add_item(&header.serialize_to_vec()),
+            META_HEADER_OFFSET
+        );
+        assert_eq!(root.add_item(&old.serialize_to_vec()), META_OFFSET);
+        root.commit();
+
+        let meta = MetaPage::fetch(&index);
+        assert_eq!(meta, expected);
+        {
+            let root = unsafe { page::ReadablePage::read(&index, META_BLOCK_NUMBER) };
+            assert_eq!(root.get_type(), PageType::MetaV2);
+        }
+        unsafe { meta.store(&index, false) };
+        assert_current_root(&index, &meta);
     }
 }

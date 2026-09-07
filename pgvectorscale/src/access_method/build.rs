@@ -9,12 +9,11 @@ use pgrx::pg_sys::{
 use pgrx::*;
 
 use crate::access_method::distance::DistanceType;
-use crate::access_method::graph::neighbor_store::GraphNeighborStore;
+use crate::access_method::graph::neighbor_store::{GraphNeighborStore, NeighborMergeMode};
 use crate::access_method::graph::Graph;
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
-use crate::util::ports::acquire_index_lock;
 
 use crate::access_method::DISKANN_DISTANCE_TYPE_PROC;
 use crate::util::page::PageType;
@@ -120,7 +119,7 @@ impl<'a> BuildStateParallel<'a> {
                 .shared_state
                 .build_state
                 .ntuples
-                .fetch_add(1, Ordering::Relaxed)
+                .fetch_add(1, Ordering::Release)
                 + 1;
 
             // Signal waiting workers when threshold is reached
@@ -141,7 +140,7 @@ impl<'a> BuildStateParallel<'a> {
             self.shared_state
                 .build_state
                 .initializing_worker_done
-                .store(true, Ordering::Relaxed);
+                .store(true, Ordering::Release);
 
             // Signal waiting workers that initialization is done
             unsafe {
@@ -476,12 +475,13 @@ unsafe fn aminsert_internal(
 ) -> bool {
     let index_relation = PgRelation::from_pg(indexrel);
     let heap_relation = PgRelation::from_pg(heaprel);
+    let profile = super::guc::TSV_LOG_INSERT_STATS.get();
+    let started = profile.then(Instant::now);
 
-    // Acquire advisory txn-level lock to serialize all index operations.
-    // This prevents concurrent update races (and snapshot-isolation anomalies)
-    // in meta_page, tape, and index pages.  TODO: allow more concurrency.
-    acquire_index_lock(&index_relation);
+    // Adjacency updates validate their snapshots under short page locks;
+    // entrypoint publication has separate operation-scoped coordination.
     let mut meta_page = MetaPage::fetch(&index_relation);
+    let metadata_us = started.map_or(0, |t| t.elapsed().as_micros());
 
     let vec = LabeledVector::from_datums(values, isnull, &meta_page);
     if vec.is_none() {
@@ -492,11 +492,16 @@ unsafe fn aminsert_internal(
 
     let heap_pointer = ItemPointer::with_item_pointer_data(*heap_tid);
     let mut storage = meta_page.get_storage_type();
-    let mut stats = InsertStats::default();
+    let mut stats = InsertStats {
+        metadata_us,
+        ..Default::default()
+    };
+    let mut cache_stats = None;
 
     match &mut storage {
         StorageType::Plain => {
             let plain = PlainStorage::load_for_insert(&index_relation, &heap_relation, &meta_page);
+            stats.storage_us = started.map_or(0, |t| t.elapsed().as_micros() - metadata_us);
             assert!(vec.labels().is_none());
             insert_storage(
                 &plain,
@@ -514,6 +519,7 @@ unsafe fn aminsert_internal(
                 &meta_page,
                 &mut stats.quantizer_stats,
             );
+            stats.storage_us = started.map_or(0, |t| t.elapsed().as_micros() - metadata_us);
             insert_storage(
                 &bq,
                 &index_relation,
@@ -522,7 +528,16 @@ unsafe fn aminsert_internal(
                 &mut meta_page,
                 &mut stats,
             );
+            if profile {
+                let cache = bq.cache().unwrap().borrow();
+                cache_stats = Some((cache.len(), cache.cap().get(), *cache.stats()));
+            }
         }
+    }
+    drop(meta_page);
+    stats.total_us = started.map_or(0, |t| t.elapsed().as_micros());
+    if profile {
+        stats.log(index_relation.oid(), cache_stats);
     }
     false
 }
@@ -535,6 +550,8 @@ unsafe fn insert_storage<S: Storage>(
     meta_page: &mut MetaPage,
     stats: &mut InsertStats,
 ) {
+    let profile = super::guc::TSV_LOG_INSERT_STATS.get();
+    let started = profile.then(Instant::now);
     let mut tape = Tape::resume(index_relation, S::page_type());
 
     let index_pointer = storage.create_node(
@@ -546,8 +563,12 @@ unsafe fn insert_storage<S: Storage>(
         stats,
     );
 
+    stats.node_write_us = started.map_or(0, |t| t.elapsed().as_micros());
+    let graph_started = profile.then(Instant::now);
+
     let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
     graph.insert(index_relation, index_pointer, vector, storage, stats);
+    stats.graph_us = graph_started.map_or(0, |t| t.elapsed().as_micros());
 }
 
 #[pg_guard]
@@ -649,13 +670,14 @@ pub extern "C-unwind" fn _vectorscale_build_main(
                 let ntuples = (*parallel_shared)
                     .build_state
                     .ntuples
-                    .load(Ordering::Relaxed);
+                    .load(Ordering::Acquire);
                 let init_done = (*parallel_shared)
                     .build_state
                     .initializing_worker_done
-                    .load(Ordering::Relaxed);
+                    .load(Ordering::Acquire);
 
                 if ntuples >= parallel::initial_start_nodes_count() || init_done {
+                    pg_sys::ConditionVariableCancelSleep();
                     break;
                 }
 
@@ -671,19 +693,21 @@ pub extern "C-unwind" fn _vectorscale_build_main(
 
     let (heap_lockmode, index_lockmode) = if params.is_concurrent {
         (
-            pg_sys::ShareLock as pg_sys::LOCKMODE,
-            pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+            pg_sys::ShareUpdateExclusiveLock as pg_sys::LOCKMODE,
+            pg_sys::RowExclusiveLock as pg_sys::LOCKMODE,
         )
     } else {
         (
-            pg_sys::ShareUpdateExclusiveLock as pg_sys::LOCKMODE,
-            pg_sys::RowExclusiveLock as pg_sys::LOCKMODE,
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+            pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
         )
     };
 
     let heaprel = unsafe { pg_sys::table_open(params.heaprelid, heap_lockmode) };
     let indexrel = unsafe { pg_sys::index_open(params.indexrelid, index_lockmode) };
     let index_info = unsafe { pg_sys::BuildIndexInfo(indexrel) };
+    // BuildIndexInfo does not restore this runtime flag from the catalog.
+    unsafe { (*index_info).ii_Concurrent = params.is_concurrent };
     let heap_relation = unsafe { PgRelation::from_pg(heaprel) };
     let index_relation = unsafe { PgRelation::from_pg(indexrel) };
     let meta_page = MetaPage::fetch(&index_relation);
@@ -886,10 +910,17 @@ fn do_heap_scan(
 
 fn finalize_remaining_parallel_nodes<S: Storage>(
     storage: &mut S,
-    state: BuildStateParallel,
+    mut state: BuildStateParallel,
     index_relation: &PgRelation,
     write_stats: WriteStats,
 ) -> usize {
+    // Small builds may finish before the initialization threshold. Publish all
+    // seed edges before into_build_state wakes the remaining workers.
+    if state.is_initializing_worker {
+        state
+            .graph
+            .maybe_flush_neighbor_cache(storage, &mut state.local_stats);
+    }
     // Convert parallel state to regular build state for final processing
     let build_state = state.into_build_state();
     finalize_index_build(storage, build_state, index_relation, write_stats)
@@ -898,7 +929,7 @@ fn finalize_remaining_parallel_nodes<S: Storage>(
 fn finalize_index_build<S: Storage>(
     storage: &mut S,
     state: BuildState,
-    index_relation: &PgRelation,
+    _index_relation: &PgRelation,
     mut write_stats: WriteStats,
 ) -> usize {
     let BuildState { graph, ntuples, .. } = state;
@@ -906,32 +937,23 @@ fn finalize_index_build<S: Storage>(
     let cache_entries = neighbor_store.into_sorted();
 
     for (index_pointer, entry) in cache_entries {
-        write_stats.num_nodes += 1;
-        let prune_neighbors;
-        let neighbors = if entry.neighbors.len() > meta_page.get_num_neighbors() as _ {
-            prune_neighbors = Graph::prune_neighbors(
-                meta_page.get_max_alpha(),
-                meta_page.get_num_neighbors() as _,
-                entry.labels.as_ref(),
-                entry.neighbors,
-                storage,
-                &mut write_stats.prune_stats,
-            );
-            prune_neighbors
-        } else {
-            entry.neighbors
-        };
-        write_stats.num_neighbors += neighbors.len();
-
-        storage.finalize_node_at_end_of_build(
+        let (_, neighbors) = Graph::merge_neighbors_on_disk(
+            storage,
             index_pointer,
-            neighbors.as_slice(),
-            &mut write_stats,
+            entry.labels.as_ref(),
+            &entry.neighbors,
+            meta_page.get_max_alpha(),
+            meta_page.get_num_neighbors() as usize,
+            NeighborMergeMode::Builder {
+                always_prune: false,
+            },
+            &mut write_stats.prune_stats,
         );
+        write_stats.num_nodes += 1;
+        write_stats.num_neighbors += neighbors.len();
     }
-    unsafe {
-        meta_page.store(index_relation, false);
-    }
+    // Parameters and entrypoints were published before use. Worker-local
+    // snapshots must never overwrite metadata when draining their caches.
 
     debug1!("write done");
 
@@ -1114,8 +1136,6 @@ fn build_callback_parallel_internal<S: Storage>(
 ) {
     check_for_interrupts!();
 
-    state.increment_ntuples();
-
     // Create node using local tape - PostgreSQL page locking handles concurrency
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
@@ -1137,11 +1157,15 @@ fn build_callback_parallel_internal<S: Storage>(
     );
 
     let flush_interval = parallel::flush_rate(state.shared_state.params.total_vectors);
-    if state.local_ntuples % flush_interval == 0 {
+    let completed = state.local_ntuples + 1;
+    if completed.is_multiple_of(flush_interval)
+        || (state.is_initializing_worker && completed == parallel::initial_start_nodes_count())
+    {
         state
             .graph
             .maybe_flush_neighbor_cache(storage, &mut state.local_stats);
     }
+    state.increment_ntuples();
 }
 
 const BUILD_PHASE_TRAINING: i64 = 0;

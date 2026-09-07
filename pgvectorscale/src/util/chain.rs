@@ -53,23 +53,51 @@ impl<'a, S: StatsNodeWrite> ChainTapeWriter<'a, S> {
         }
     }
 
-    pub fn reinit(
+    /// Stage a replacement root, keeping it exclusively locked until the caller commits it.
+    /// Items start at successive root offsets; all but the last must fit on the root.
+    /// Any overflow is fully written before returning, but remains unreachable until commit.
+    /// Dropping the returned page instead leaves an existing root unchanged.
+    /// For first-time writes, the relation must allocate the requested root block next.
+    pub fn prepare_root(
         index: &'a PgRelation,
         page_type: PageType,
-        stats: &'a mut S,
+        stats: &mut S,
         block_number: BlockNumber,
-    ) -> Self {
+        first_time: bool,
+        items: &[&[u8]],
+    ) -> WritablePage<'a> {
         assert!(page_type.is_chained());
-        let mut page = WritablePage::modify(index, block_number);
-        page.reinit(page_type);
-        page.commit();
+        assert!(!items.is_empty());
+        let mut root = if first_time {
+            WritablePage::new(index, page_type)
+        } else {
+            let mut page = WritablePage::modify(index, block_number);
+            // Reinitialize only the Generic WAL copy, never publish an empty root.
+            page.reinit(page_type);
+            page
+        };
+        assert_eq!(root.get_block_number(), block_number);
 
-        Self {
-            page_type,
-            index,
-            current: block_number,
-            stats,
+        for (i, data) in items.iter().enumerate() {
+            assert!(!data.is_empty());
+            let free_space = root.get_aligned_free_space();
+            assert!(free_space > CHAIN_ITEM_HEADER_SIZE);
+            let data_size = data.len().min(free_space - CHAIN_ITEM_HEADER_SIZE);
+            let next = if data_size < data.len() {
+                assert_eq!(i, items.len() - 1, "only the last root item may overflow");
+                let mut suffix = ChainTapeWriter::new(index, page_type, stats);
+                suffix.write(&data[data_size..])
+            } else {
+                ItemPointer::new_invalid()
+            };
+            let header_bytes = rkyv::to_bytes::<_, 256>(&ChainItemHeader { next }).unwrap();
+            let combined = [header_bytes.as_slice(), &data[..data_size]].concat();
+            let offset = root.add_item(&combined);
+            assert_eq!(offset as usize, i + 1);
         }
+
+        // Old suffixes (and suffixes from aborted replacements) are not reclaimed.
+        root
     }
 
     /// Write chained data to the tape, returning an `ItemPointer` to the start of the data.
@@ -208,6 +236,81 @@ mod tests {
             .unwrap()
             .expect("oid was null");
         unsafe { PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid)) }
+    }
+
+    fn read_root_items(index: &PgRelation, expected: &[&[u8]]) {
+        let mut stats = InsertStats::default();
+        // Match metadata fetch: retain a root share lock while reading both chains.
+        let root = unsafe { ReadablePage::read(index, 0) };
+        assert_eq!(root.get_type(), PageType::Meta);
+        for (i, data) in expected.iter().enumerate() {
+            let mut reader = ChainItemReader::new(index, PageType::Meta, &mut stats);
+            let actual: Vec<u8> = reader
+                .read(ItemPointer::new(0, (i + 1) as pg_sys::OffsetNumber))
+                .flat_map(|item| item.get_data_slice().to_vec())
+                .collect();
+            assert_eq!(actual.as_slice(), *data);
+        }
+    }
+
+    #[pg_test]
+    fn test_chain_root_replacement() {
+        let index = make_test_relation();
+        let mut stats = InsertStats::default();
+        let header = b"root header";
+        for size in [3 * BLCKSZ as usize, 1, BLCKSZ as usize, 17] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            ChainTapeWriter::prepare_root(
+                &index,
+                PageType::Meta,
+                &mut stats,
+                0,
+                false,
+                &[header, &data],
+            )
+            .commit();
+            read_root_items(&index, &[header, &data]);
+        }
+    }
+
+    #[pg_test]
+    fn test_chain_root_abort_before_publication() {
+        let index = make_test_relation();
+        let mut stats = InsertStats::default();
+        let old_data = vec![42; 3 * BLCKSZ as usize];
+        ChainTapeWriter::prepare_root(
+            &index,
+            PageType::Meta,
+            &mut stats,
+            0,
+            false,
+            &[b"old header", &old_data],
+        )
+        .commit();
+
+        let new_data = vec![99; 4 * BLCKSZ as usize];
+        let root = ChainTapeWriter::prepare_root(
+            &index,
+            PageType::Meta,
+            &mut stats,
+            0,
+            false,
+            &[b"new header", &new_data],
+        );
+        // Suffix writes have finished, but abort the root's Generic WAL operation.
+        drop(root);
+        read_root_items(&index, &[b"old header", &old_data]);
+
+        ChainTapeWriter::prepare_root(
+            &index,
+            PageType::Meta,
+            &mut stats,
+            0,
+            false,
+            &[b"new header", &new_data],
+        )
+        .commit();
+        read_root_items(&index, &[b"new header", &new_data]);
     }
 
     #[pg_test]

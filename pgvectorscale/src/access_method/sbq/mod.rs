@@ -185,6 +185,7 @@ impl NodeDistanceMeasure for SbqNodeDistanceMeasure<'_> {
     ) -> f32 {
         let mut cache = self.storage.cache().as_ref().unwrap().borrow_mut();
         let vec1 = cache.get(index_pointer, self.storage, stats);
+        stats.record_quantized_distance_comparison();
         distance_xor_optimized(vec1, self.vec.as_slice()) as f32
     }
 }

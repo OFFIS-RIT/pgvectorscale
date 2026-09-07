@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::num::NonZero;
 
 use pgrx::debug1;
@@ -15,6 +14,17 @@ use crate::access_method::stats::PruneNeighborStats;
 use crate::access_method::storage::Storage;
 
 use super::Graph;
+
+#[cfg(any(test, feature = "pg_test"))]
+#[path = "neighbor_store_tests.rs"]
+mod tests;
+
+/// Preserve candidate ordering and pruning policy at each writeback site.
+#[derive(Clone, Copy)]
+pub(crate) enum NeighborMergeMode {
+    Disk,
+    Builder { always_prune: bool },
+}
 
 /// A builderGraph is a graph that keep the neighbors in-memory in the neighbor_map below
 /// The idea is that during the index build, you don't want to update the actual Postgres
@@ -53,28 +63,6 @@ pub struct BuilderNeighborCache {
 }
 
 impl BuilderNeighborCache {
-    fn reconcile_with_disk_neighbors<S: Storage>(
-        &self,
-        neighbors_of: ItemPointer,
-        cached_neighbors: Vec<NeighborWithDistance>,
-        storage: &S,
-        stats: &mut PruneNeighborStats,
-    ) -> Vec<NeighborWithDistance> {
-        let disk_neighbors = storage.get_neighbors_with_distances_from_disk(neighbors_of, stats);
-        let mut all_neighbors = Vec::with_capacity(cached_neighbors.len() + disk_neighbors.len());
-
-        let cached_pointers: HashSet<_> = cached_neighbors
-            .iter()
-            .map(|n| n.get_index_pointer_to_neighbor())
-            .collect();
-        all_neighbors.extend(cached_neighbors);
-        all_neighbors.extend(disk_neighbors.into_iter().filter(|disk_neighbor| {
-            !cached_pointers.contains(&disk_neighbor.get_index_pointer_to_neighbor())
-        }));
-
-        all_neighbors
-    }
-
     pub fn new(memory_budget: f64, meta_page: &MetaPage, worker_count: usize) -> Self {
         let total_memory = maintenance_work_mem_bytes() as f64;
         let memory_budget = (total_memory * memory_budget).ceil() as usize;
@@ -88,7 +76,7 @@ impl BuilderNeighborCache {
 
         Self {
             neighbor_map: RefCell::new(LruCacheWithStats::new(
-                NonZero::new(capacity).unwrap(),
+                NonZero::new(capacity.max(1)).unwrap(),
                 "Builder neighbor",
             )),
             num_neighbors: meta_page.get_num_neighbors() as _,
@@ -148,50 +136,46 @@ impl BuilderNeighborCache {
         storage: &S,
         stats: &mut PruneNeighborStats,
     ) {
-        let mut neighbor_map = self.neighbor_map.borrow_mut();
+        // Cache fills must retain the source labels used by label-aware pruning.
+        let labels = labels.or_else(|| storage.get_labels(neighbors_of, stats));
         new_neighbors.shrink_to_fit();
-        let evictee =
-            neighbor_map.push(neighbors_of, NeighborCacheEntry::new(labels, new_neighbors));
+        let evictee = {
+            let mut neighbor_map = self.neighbor_map.borrow_mut();
+            neighbor_map.push(neighbors_of, NeighborCacheEntry::new(labels, new_neighbors))
+        };
         if let Some((key, value)) = evictee {
-            let all_neighbors =
-                self.reconcile_with_disk_neighbors(key, value.neighbors, storage, stats);
-            let new_neighbors = Graph::prune_neighbors(
+            Graph::merge_neighbors_on_disk(
+                storage,
+                key,
+                value.labels.as_ref(),
+                &value.neighbors,
                 self.max_alpha,
                 self.num_neighbors,
-                value.labels.as_ref(),
-                all_neighbors,
-                storage,
+                NeighborMergeMode::Builder { always_prune: true },
                 stats,
             );
-            storage.set_neighbors_on_disk(key, new_neighbors.as_slice(), stats);
         }
     }
 
-    /// Flush cached entries to disk if cache usage is above the given threshold.
-    /// This helps prevent memory buildup during parallel builds.
+    /// Reconcile and flush all cached entries, publishing changes to other workers.
     pub fn flush_neighbor_cache<S: Storage>(&self, storage: &S, stats: &mut PruneNeighborStats) {
-        let mut cache = self.neighbor_map.borrow_mut();
-        while cache.len() > 0 {
-            let (neighbors_of, entry) = cache.pop_lru().unwrap();
-            drop(cache);
-            let all_neighbors =
-                self.reconcile_with_disk_neighbors(neighbors_of, entry.neighbors, storage, stats);
-
-            let pruned_neighbors = if all_neighbors.len() > self.num_neighbors {
-                Graph::prune_neighbors(
-                    self.max_alpha,
-                    self.num_neighbors,
-                    entry.labels.as_ref(),
-                    all_neighbors,
-                    storage,
-                    stats,
-                )
-            } else {
-                all_neighbors
+        loop {
+            let entry = self.neighbor_map.borrow_mut().pop_lru();
+            let Some((neighbors_of, entry)) = entry else {
+                break;
             };
-
-            storage.set_neighbors_on_disk(neighbors_of, &pruned_neighbors, stats);
-            cache = self.neighbor_map.borrow_mut();
+            Graph::merge_neighbors_on_disk(
+                storage,
+                neighbors_of,
+                entry.labels.as_ref(),
+                &entry.neighbors,
+                self.max_alpha,
+                self.num_neighbors,
+                NeighborMergeMode::Builder {
+                    always_prune: false,
+                },
+                stats,
+            );
         }
     }
 }
@@ -218,21 +202,20 @@ impl GraphNeighborStore {
         }
     }
 
-    pub fn set_neighbors<S: Storage>(
+    /// Newly created disk nodes already have empty adjacency. Only the builder
+    /// needs a cache entry before the node is published as a start node.
+    pub fn initialize_neighbors<S: Storage>(
         &self,
         storage: &S,
         neighbors_of: ItemPointer,
         labels: Option<LabelSet>,
-        new_neighbors: Vec<NeighborWithDistance>,
         stats: &mut PruneNeighborStats,
     ) {
         match self {
             GraphNeighborStore::Builder(b) => {
-                b.set_neighbors(neighbors_of, labels, new_neighbors, storage, stats)
+                b.set_neighbors(neighbors_of, labels, Vec::new(), storage, stats)
             }
-            GraphNeighborStore::Disk => {
-                storage.set_neighbors_on_disk(neighbors_of, new_neighbors.as_slice(), stats)
-            }
+            GraphNeighborStore::Disk => {}
         }
     }
 

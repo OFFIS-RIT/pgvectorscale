@@ -264,6 +264,12 @@ impl<'a> ReadablePage<'a> {
         Self { buffer, page }
     }
 
+    /// PostgreSQL's PageIsNew contract, checked while holding the shared buffer lock.
+    /// Aborting a new page's Generic WAL record can leave the allocation uninitialized.
+    pub fn is_new(&self) -> bool {
+        unsafe { (*self.page.cast::<pg_sys::PageHeaderData>()).pd_upper == 0 }
+    }
+
     pub fn get_type(&self) -> PageType {
         let opaque_data = TsvPageOpaqueData::read_from_page(&self.page);
         PageType::from_u8(opaque_data.page_type)
